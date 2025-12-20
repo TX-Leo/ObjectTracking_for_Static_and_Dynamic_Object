@@ -1,0 +1,1 @@
+python cotracker.py --mps_path "./test_data/mps_TEST_vrs/" --save_path "./test_data/mps_TEST_vrs/cotracker/"
