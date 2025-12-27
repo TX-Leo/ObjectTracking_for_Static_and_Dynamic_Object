@@ -19,13 +19,6 @@ if parent_dir not in sys.path:
 
 from aria.AriaDataset import AriaDataset
 
-class GeometryHelper:
-    @staticmethod
-    def rotate_point_vis_to_raw(u_vis, v_vis, vis_w, vis_h):
-        """Portrait (显示) -> Landscape (原始)"""
-        u_raw = v_vis
-        v_raw = vis_w - 1 - u_vis
-        return float(u_raw), float(v_raw)
 
 # ==============================================================================
 # [Module] 交互式选择器 (支持多点模式)
@@ -38,7 +31,7 @@ class AriaHandleSelector:
         self.state = {
             "ref_frame_idx": 0,
             "split_frame_idx": 0,
-            "handle_points_vis": [], 
+            "handle_points_2d": [], 
             "confirmed": False
         }
         self.current_img_vis = None
@@ -51,9 +44,9 @@ class AriaHandleSelector:
 
     def _draw_points(self, img):
         img_draw = img.copy()
-        for i, p in enumerate(self.state["handle_points_vis"]):
+        for i, p in enumerate(self.state["handle_points_2d"]):
             color = self.colors[i % len(self.colors)]
-            cv2.circle(img_draw, p, 8, color, -1)
+            cv2.circle(img_draw, p, 3, color, -1)
             cv2.putText(img_draw, str(i), (p[0]+10, p[1]-10), 
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
         return img_draw
@@ -61,22 +54,22 @@ class AriaHandleSelector:
     def _get_frame_data(self, idx):
         self.current_img_vis = cv2.cvtColor(self.dataset[idx].cam.rgb, cv2.COLOR_BGR2RGB)
         img_draw = self._draw_points(self.current_img_vis)
-        return img_draw, f"当前预览帧: {idx} | 已标 {len(self.state['handle_points_vis'])} 点"
+        return img_draw, f"当前预览帧: {idx} | 已标 {len(self.state['handle_points_2d'])} 点"
 
     def _on_click(self, evt: gr.SelectData):
         x, y = evt.index[0], evt.index[1]
-        self.state["handle_points_vis"].append((x, y))
+        self.state["handle_points_2d"].append((x, y))
         img_draw = self._draw_points(self.current_img_vis)
-        return img_draw, f"已标注第 {len(self.state['handle_points_vis'])} 个点: ({x}, {y})"
+        return img_draw, f"已标注第 {len(self.state['handle_points_2d'])} 个点: ({x}, {y})"
 
     def _undo(self):
-        if self.state["handle_points_vis"]:
-            self.state["handle_points_vis"].pop()
+        if self.state["handle_points_2d"]:
+            self.state["handle_points_2d"].pop()
         img_draw = self._draw_points(self.current_img_vis)
-        return img_draw, f"已撤销，当前剩余 {len(self.state['handle_points_vis'])} 点"
+        return img_draw, f"已撤销，当前剩余 {len(self.state['handle_points_2d'])} 点"
 
     def _clear(self):
-        self.state["handle_points_vis"] = []
+        self.state["handle_points_2d"] = []
         return self.current_img_vis, "已清空所有点"
 
     def _set_as_ref(self, idx):
@@ -88,7 +81,7 @@ class AriaHandleSelector:
         return f"已设定分界帧: {idx}"
 
     def _confirm(self):
-        if len(self.state["handle_points_vis"]) < 3:
+        if len(self.state["handle_points_2d"]) < 3:
             return "错误: 至少需要标注 3 个点才能进行 PnP 解算！"
         self.state["confirmed"] = True
         return "配置已保存！请回到控制台查看输出并关闭网页。"
@@ -154,16 +147,13 @@ def main():
     selector = AriaHandleSelector(dataset)
     res = selector.launch_ui()
 
-    # 处理坐标转换
-    h_vis, w_vis = dataset[0].cam.rgb.shape[:2]
-    points_raw = [GeometryHelper.rotate_point_vis_to_raw(p[0], p[1], w_vis, h_vis) for p in res["handle_points_vis"]]
+    points_raw = [(float(p[0]), float(p[1])) for p in res["handle_points_2d"]]
 
     config_data = {
         "reference_frame_idx": res["ref_frame_idx"],
         "split_frame_idx": res["split_frame_idx"],
-        "num_points": len(res["handle_points_vis"]),
-        "handle_points_2d_vis": res["handle_points_vis"],
-        "handle_points_2d_raw": points_raw
+        "num_points": len(res["handle_points_2d"]),
+        "handle_points_2d": res["handle_points_2d"]
     }
 
     out_path = os.path.join(save_dir, "handle_selection.json")
@@ -173,9 +163,10 @@ def main():
     print(f"\n[Success] 标注完成！")
     print(f" - 参考帧: {res['ref_frame_idx']}")
     print(f" - 分界帧: {res['split_frame_idx']}")
-    print(f" - 总点数: {len(res['handle_points_vis'])}")
+    print(f" - 总点数: {len(res['handle_points_2d'])}")
     print(f" - 结果保存至: {out_path}")
 
 if __name__ == "__main__":
     main()
-# python handle_selection_v2.py --mps_path "../data/mps_open_cabinet_5_vrs/"
+
+# python HandleSelection.py --mps_path "../data/mps_open_cabinet_5_vrs/"

@@ -1,10 +1,12 @@
 # -*- coding: utf-8 -*-
+# @FileName: static_solver.py
+# @Description: 第二阶段：静态场景 3D 点云解算与追踪评估。
+
 import os
 import cv2
 import sys
 import json
 import torch
-import imageio
 import numpy as np
 import open3d as o3d
 import matplotlib.pyplot as plt
@@ -24,7 +26,9 @@ try:
     HAS_COTRACKER = True
 except ImportError:
     HAS_COTRACKER = False
+    print("Warning: CoTracker not found. tracking will fail.")
 
+COTRACKER_RES = 640
 # ==============================================================================
 # [Module 1] 几何数学类
 # ==============================================================================
@@ -32,6 +36,7 @@ except ImportError:
 class MathUtils:
     @staticmethod
     def triangulate_n_views(poses, k_matrices, tracks_2d):
+        """ 多视图三角化 """
         A = []
         for T_c2w, K, (u, v) in zip(poses, k_matrices, tracks_2d):
             T_w2c = np.linalg.inv(T_c2w)
@@ -50,7 +55,7 @@ class AriaStaticSolver:
     def __init__(self, dataset: AriaDataset, config_path: str, device="cuda"):
         self.dataset = dataset
         self.device = device
-        self.img_h = dataset[0].cam.rgb.shape[0]
+        self.img_h, self.img_w = dataset[0].cam.rgb.shape[:2]
         
         with open(config_path, 'r') as f:
             self.config = json.load(f)
@@ -58,35 +63,49 @@ class AriaStaticSolver:
         self.ref_idx = self.config["reference_frame_idx"]
         self.split_idx = self.config["split_frame_idx"]
         self.init_pts_raw = self.config["handle_points_2d_raw"]
-        self.num_pts = len(self.init_pts_raw) # 动态获取点数
+        self.num_pts = len(self.init_pts_raw)
+        self.target_res = COTRACKER_RES
 
     def run_tracking(self):
-        print(f"\n[Task 1/5] 执行 CoTracker 静态追踪 (点数: {self.num_pts})...")
+        if not HAS_COTRACKER:
+            raise ImportError("CoTracker is required for this step.")
+            
+        print(f"\n[Task 1/5] 执行 CoTracker 静态追踪 (分辨率: {self.target_res}x{self.target_res})...")
         frames = []
-        target_res = 512
-        scale = target_res / self.img_h
-        # 只追踪到运动开始前
+        # 分别计算宽和高的缩放比例
+        scale_w = self.target_res / self.img_w
+        scale_h = self.target_res / self.img_h
+
+        # 1. 准备视频流
         for i in tqdm(range(self.split_idx + 1), desc="Loading Video"):
-            img_vis = self.dataset[i].cam.rgb
-            frames.append(cv2.resize(np.rot90(img_vis, k=1), (target_res, target_res)))
+            img = self.dataset[i].cam.rgb
+            # 直接 resize，不旋转
+            frames.append(cv2.resize(img, (self.target_res, self.target_res)))
         
         video = torch.from_numpy(np.stack(frames)).permute(0, 3, 1, 2)[None].to(self.device).float()
-        queries = [[float(self.ref_idx), p[0] * scale, p[1] * scale] for p in self.init_pts_raw]
         
+        # 2. 准备查询点 (u 对应 x_scale, v 对应 y_scale)
+        queries = []
+        for p in self.init_pts_raw:
+            queries.append([float(self.ref_idx), p[0] * scale_w, p[1] * scale_h])
+        
+        # 3. 推理
         ckpt = os.path.join(os.path.dirname(__file__), "checkpoints/scaled_offline.pth")
         model = CoTrackerPredictor(checkpoint=ckpt).to(self.device)
         with torch.no_grad():
             pred_tracks, _ = model(video, queries=torch.tensor([queries]).to(self.device).float())
         
-        tracks_raw = pred_tracks[0].cpu().numpy() / scale
-        return tracks_raw
+        # 4. 坐标还原
+        tracks_out = pred_tracks[0].cpu().numpy()
+        tracks_out[:, :, 0] /= scale_w
+        tracks_out[:, :, 1] /= scale_h
+        return tracks_out
 
     def solve_3d_with_metrics(self, tracks_raw):
         print(f"[Task 2/5] 正在执行多视图三角化 (共 {self.num_pts} 个点)...")
         pts_3d = []
         errors_per_frame = []
 
-        # 遍历每一个点进行三角化
         for pt_idx in range(self.num_pts):
             poses, ks, obs_2d = [], [], []
             for i in range(self.split_idx + 1):
@@ -99,7 +118,7 @@ class AriaStaticSolver:
             
         pts_3d = np.array(pts_3d)
 
-        # --- 计算重投影误差指标 ---
+        # 计算重投影误差
         total_rmse = 0
         for i in range(self.split_idx + 1):
             s = self.dataset[i]
@@ -115,17 +134,10 @@ class AriaStaticSolver:
             total_rmse += np.mean(frame_errs)
         
         avg_rmse = total_rmse / (self.split_idx + 1)
-        
-        # 计算相邻点之间的距离作为刚体参考
-        dists = []
-        for k in range(self.num_pts - 1):
-            dists.append(np.linalg.norm(pts_3d[k+1] - pts_3d[k]))
+        dists = [np.linalg.norm(pts_3d[k+1] - pts_3d[k]) for k in range(self.num_pts - 1)]
         
         print(f"\n" + "="*40)
-        print(f"解算精度报告 (点数: {self.num_pts}):")
-        print(f" -> 平均重投影误差: {avg_rmse:.3f} 像素")
-        print(f" -> 相邻点间距 (cm): {[round(d*100, 2) for d in dists]}")
-        print(f" -> 状态评级: {'⭐优质' if avg_rmse < 3 else '⚠️待检查'}")
+        print(f"解算精度报告: 平均误差 {avg_rmse:.3f} px | 状态: {'⭐优质' if avg_rmse < 3 else '⚠️待检查'}")
         print("="*40)
         
         return pts_3d, {"rmse": avg_rmse, "dists": dists}, errors_per_frame
@@ -147,10 +159,9 @@ class StaticQualitativeEvaluator:
             pcd.paint_uniform_color([0.3, 0.3, 0.3])
             all_geoms.append(pcd)
 
-        # 动态生成颜色
         cmap = plt.get_cmap('tab10')
         for i in range(len(pts_3d)):
-            sphere = o3d.geometry.TriangleMesh.create_sphere(radius=0.012)
+            sphere = o3d.geometry.TriangleMesh.create_sphere(radius=0.01)
             sphere.translate(pts_3d[i])
             sphere.paint_uniform_color(cmap(i % 10)[:3])
             all_geoms.append(sphere.sample_points_uniformly(200))
@@ -163,11 +174,14 @@ class StaticQualitativeEvaluator:
         plt.figure(figsize=(10, 4))
         plt.plot(errors, color='purple', label='Reprojection Error')
         plt.axhline(y=np.mean(errors), color='r', linestyle='--')
+        plt.title("Static Solver Reprojection Error (px)")
         plt.savefig(os.path.join(self.save_dir, "static_solver_eval.png"))
+        plt.close()
 
 class EnhancedVisualizer:
     def __init__(self, dataset, save_dir):
-        self.dataset = dataset; self.save_dir = save_dir
+        self.dataset = dataset
+        self.save_dir = save_dir
         self.cmap = plt.get_cmap('hsv')
 
     def render_static_rainbow(self, tracks_raw, points_3d, split_idx, fps=10):
@@ -182,18 +196,20 @@ class EnhancedVisualizer:
             T_w2c = np.linalg.inv(self.dataset[i].cam.c2w)
             
             for j in range(num_pts):
-                # 1. 绘制历史轨迹
-                for t in range(max(1, i - 10), i + 1):
-                    p1 = (int(h_vis - 1 - tracks_raw[t-1, j, 1]), int(tracks_raw[t-1, j, 0]))
-                    p2 = (int(h_vis - 1 - tracks_raw[t, j, 1]), int(tracks_raw[t, j, 0]))
-                    cv2.line(img, p1, p2, [int(c*255) for c in self.cmap(j/num_pts)[:3][::-1]], 2)
+                color = [int(c*255) for c in self.cmap(j/num_pts)[:3][::-1]]
                 
-                # 2. 绘制 3D 重投影点
+                # 1. 轨迹 (直接使用 u, v)
+                for t in range(max(1, i - 10), i + 1):
+                    p1 = (int(tracks_raw[t-1, j, 0]), int(tracks_raw[t-1, j, 1]))
+                    p2 = (int(tracks_raw[t, j, 0]), int(tracks_raw[t, j, 1]))
+                    cv2.line(img, p1, p2, color, 2)
+                
+                # 2. 3D 投影点 (白心彩色边)
                 pc = T_w2c[:3,:3] @ points_3d[j] + T_w2c[:3,3]
                 uv_h = self.dataset[i].cam.k @ pc
-                uv = (int(h_vis-1-uv_h[1]/uv_h[2]), int(uv_h[0]/uv_h[2]))
-                cv2.circle(img, uv, 5, (255, 255, 255), -1)
-                cv2.circle(img, uv, 3, [int(c*255) for c in self.cmap(j/num_pts)[:3][::-1]], -1)
+                uv = (int(uv_h[0]/uv_h[2]), int(uv_h[1]/uv_h[2]))
+                cv2.circle(img, uv, 6, (255, 255, 255), -1)
+                cv2.circle(img, uv, 4, color, -1)
             
             out.write(img)
         out.release()
@@ -207,7 +223,9 @@ def main():
 
     save_dir = os.path.join(args.mps_path, "cotracker")
     config_path = os.path.join(save_dir, "handle_selection.json")
-    vrs = os.path.join(args.mps_path, [f for f in os.listdir(args.mps_path) if f.endswith('.vrs')][0])
+    
+    vrs_files = [f for f in os.listdir(args.mps_path) if f.endswith('.vrs')]
+    vrs = os.path.join(args.mps_path, vrs_files[0])
     hand_csv = os.path.join(args.mps_path, "hand_tracking/hand_tracking_results.csv")
     
     ds = AriaDataset(args.mps_path, vrs, hand_csv, save_dir)
@@ -216,27 +234,24 @@ def main():
     tracks_raw = solver.run_tracking()
     pts_3d_world, metrics, error_list = solver.solve_3d_with_metrics(tracks_raw)
     
-    # --- 生成逐帧数据 ---
+    # --- 生成 JSON 逐帧数据 ---
     per_frame_data = []
     for i in range(solver.split_idx + 1):
         s = ds[i]
-        T_w2c = np.linalg.inv(s.cam.c2w) # s.cam.c2w 已经是 T_world_cam
+        T_w2c = np.linalg.inv(s.cam.c2w)
         
         current_frame_p3d_cam = []
         current_frame_p2d_vis = []
         
         for p_world in pts_3d_world:
+            # 3D 坐标转换到相机系
             p_cam = T_w2c[:3, :3] @ p_world + T_w2c[:3, 3]
             current_frame_p3d_cam.append(p_cam.tolist())
             
+            # 投影到像素系 (完全对齐，无需坐标翻转)
             uv_h = s.cam.k @ p_cam
-            u_raw, v_raw = uv_h[0] / uv_h[2], uv_h[1] / uv_h[2]
-            
-            # 这里的坐标映射逻辑需与之前保持一致
-            h_vis = s.cam.h 
-            u_vis = h_vis - 1 - v_raw
-            v_vis = u_raw
-            current_frame_p2d_vis.append([int(u_vis), int(v_vis)])
+            u, v = uv_h[0] / uv_h[2], uv_h[1] / uv_h[2]
+            current_frame_p2d_vis.append([float(u), float(v)])
             
         per_frame_data.append({
             "frame": i,
@@ -245,13 +260,13 @@ def main():
             "p2d_vis": current_frame_p2d_vis
         })
 
-    # --- 保存结果 ---
+    # --- 保存最终结果 ---
     output_json = {
         "metadata": {
             "reference_frame_idx": solver.ref_idx,
             "split_frame_idx": solver.split_idx,
             "num_points": solver.num_pts,
-            "average_reprojection_rmse": metrics["rmse"]
+            "average_reprojection_rmse_px": metrics["rmse"]
         },
         "static_handle_points_world": pts_3d_world.tolist(),
         "adjacent_distances_m": metrics["dists"],
@@ -261,11 +276,18 @@ def main():
     with open(os.path.join(save_dir, "static_solver_results.json"), 'w') as f:
         json.dump(output_json, f, indent=4)
     
-    # 评估与渲染
+    # --- 渲染与导出 ---
     evaluator = StaticQualitativeEvaluator(ds, save_dir)
     evaluator.export_3d_alignment_check(pts_3d_world, args.mps_path)
     evaluator.plot_error_analysis(error_list)
-    EnhancedVisualizer(ds, save_dir).render_static_rainbow(tracks_raw, pts_3d_world, solver.split_idx)
+    
+    vis = EnhancedVisualizer(ds, save_dir)
+    vis.render_static_rainbow(tracks_raw, pts_3d_world, solver.split_idx)
+    
+    print(f"\n[Success] 静态解算完成！")
+    print(f" - 结果 JSON: {os.path.join(save_dir, 'static_solver_results.json')}")
+    print(f" - 调试视频: {os.path.join(save_dir, 'static_solver_vis.mp4')}")
+    print(f" - 对齐点云: {os.path.join(save_dir, 'static_solver_pc.ply')}")
 
 if __name__ == "__main__":
     main()
