@@ -1,6 +1,5 @@
 .DS_Store
 checkpoints/
-git_push.sh
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

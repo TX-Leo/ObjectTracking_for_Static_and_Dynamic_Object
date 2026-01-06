@@ -13,22 +13,41 @@ from tqdm import tqdm
 import math
 import gc
 import argparse
-from pathlib import Path
 from typing import List, Dict
 from scipy.signal import medfilt
+from huggingface_hub import hf_hub_download
 
 from cotracker.predictor import CoTrackerPredictor
 
 # [Config]
-COTRACKER_RES = 640 
+COTRACKER_RES = 640 # 640
 HEATMAP_SIGMA=  10
 
+class NumpyEncoder(json.JSONEncoder):
+    """ 自定义编码器以处理 NumPy 数据类型 """
+    def default(self, obj):
+        if isinstance(obj, (np.float32, np.float64, np.float16)):
+            return float(obj)
+        if isinstance(obj, (np.int32, np.int64, np.uint32, np.uint64)):
+            return int(obj)
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        return super(NumpyEncoder, self).default(obj)
+    
 class ObjectTrackingCoTrackerPredictor:
-    def __init__(self, checkpoint_path: str, res: int = 640, device: str = "cuda"):
-        self.device = device
+    def __init__(self, res: int = 640, device: str = "cuda"):
         self.res = res
-        print(f"║ [Predictor] Loading CoTracker Weights: {os.path.basename(checkpoint_path)}")
-        self.model = CoTrackerPredictor(checkpoint=checkpoint_path).to(device)
+        self.device = device if device else ('cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
+        print(f"║ [Predictor] Checking/Downloading CoTracker weights from Hugging Face Cache...")
+        try:
+            ckpt_path = hf_hub_download(repo_id="facebook/cotracker3", filename="scaled_offline.pth")
+            print(f"Weights is downloaded successfully to: {ckpt_path}")
+        except Exception as e:
+            print(f"║ [Error] Failed to download weights: {e}")
+            raise e
+
+        self.model = CoTrackerPredictor(checkpoint=ckpt_path).to(device)
+        # self.model.load_state_dict(torch.load(ckpt_path, map_location='cpu'))
 
     def _infer_segment(self, frames_np: np.ndarray, queries: List):
         """执行单段推理并释放显存"""
@@ -46,6 +65,18 @@ class ObjectTrackingCoTrackerPredictor:
         gc.collect()
         
         return tracks, visibilities
+
+    def cleanup(self):
+        """彻底释放 Predictor 占据的显存"""
+        if hasattr(self, 'model'):
+            # 将模型移回 CPU 并删除
+            self.model.to("cpu")
+            del self.model
+        
+        # 清除可能的残余变量
+        gc.collect()
+        torch.cuda.empty_cache()
+        print("║ [Cleanup] Predictor model removed from GPU.")
 
     def run_segmented_tracking(self, img_paths: List[str], ref_idx: int, split_idx: int, init_points: List):
         """分段追踪逻辑，适应长序列并记录性能指标"""
@@ -269,8 +300,7 @@ class ObjectTrackingCoTracker:
         self.res = COTRACKER_RES
         self.aria_dir = os.path.join(mps_path, "aria")
         self._load_configs()
-        ckpt = os.path.join(Path(__file__).resolve().parent, "checkpoints/scaled_offline.pth")
-        self.predictor = ObjectTrackingCoTrackerPredictor(ckpt, res=self.res)
+        self.predictor = ObjectTrackingCoTrackerPredictor(self.res)
 
     def _load_configs(self):
         config_path = os.path.join(self.aria_dir, "ot_keypoints_selector.json")
@@ -370,7 +400,7 @@ class ObjectTrackingCoTracker:
         
         save_path = os.path.join(self.aria_dir, "ot_cotracker_results.json")
         with open(save_path, 'w') as f:
-            json.dump(res_save, f, indent=4)
+            json.dump(res_save, f, indent=4, cls=NumpyEncoder)
 
         # 4. 打印报告
         self.print_professional_report(meta, eval_results, point_stats)
@@ -386,6 +416,36 @@ class ObjectTrackingCoTracker:
         print(f"║ [Status] Results saved to: {save_path} ║")
         print("╚" + "═" * 60 + "╝\n")
 
+        self.cleanup()
+        # 再次确认回收
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    def cleanup(self):
+        """释放 CoTracker 模块占用的所有资源"""
+        print("\n" + "╔" + "═" * 60 + "╗")
+        print(f"║{'CLEANING UP COTRACKER RESOURCES':^60}║")
+        
+        # 1. 清理 Predictor 内部的模型
+        if hasattr(self, 'predictor'):
+            self.predictor.cleanup()
+            del self.predictor
+        
+        # 2. 清理大型数据对象
+        if hasattr(self, 'img_paths'):
+            del self.img_paths
+            
+        # 3. 强制垃圾回收
+        gc.collect()
+        
+        # 4. 清空显存缓存
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+            
+        print(f"║{'CUDA MEMORY FULLY RELEASED':^60}║")
+        print("╚" + "═" * 60 + "╝\n")
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--mps_path", type=str, required=True, help="Path to the MPS directory")
@@ -396,4 +456,4 @@ if __name__ == "__main__":
 
 # conda activate aria
 # cd src
-# python -m object_tracking.ObjectTrackingCoTracker --mps_path "./data/open_cabinet_0/mps_open_cabinet_0_5_vrs/" 
+# python -m object_tracking.ObjectTrackingCoTracker --mps_path "./data/open_cabinet_0/mps_open_cabinet_0_000_vrs/" 

@@ -176,6 +176,46 @@ class ObjectTrackingDIFT:
         # 最终特征：[1, C1+C2, H, W]
         return torch.cat([final_f1, final_f2], dim=1)
 
+    def cleanup(self):
+        """释放模型占据的显存"""
+        print("[*] Releasing CUDA memory...")
+        # 1. 将模型移至 CPU (可选，但有助于彻底断开显存引用)
+        if hasattr(self, 'unet'): self.unet.to("cpu")
+        if hasattr(self, 'vae'): self.vae.to("cpu")
+        if hasattr(self, 'text_encoder'): self.text_encoder.to("cpu")
+
+        # 2. 删除引用
+        del self.unet
+        del self.vae
+        del self.text_encoder
+        if hasattr(self, 'tokenizer'): del self.tokenizer
+
+        # 3. 强制垃圾回收
+        import gc
+        gc.collect()
+
+        # 4. 清空 PyTorch 缓存池
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect() # 针对多进程显存的回收
+        print("[+] CUDA memory released.")
+
+    def visualize(self, src_path, tgt_path, src_pts, tgt_pts, save_path):
+        img1 = cv2.imread(src_path)
+        img2 = cv2.imread(tgt_path)
+        
+        colors = [(0, 255, 0), (0, 0, 255), (255, 0, 0), (0, 255, 255), (255, 0, 255), (255, 255, 0)]
+        
+        for i, ((x1, y1), (x2, y2)) in enumerate(zip(src_pts, tgt_pts)):
+            color = colors[i % len(colors)]
+            cv2.circle(img1, (int(x1), int(y1)), 8, color, -1)
+            cv2.circle(img2, (int(x2), int(y2)), 8, color, -1)
+            cv2.putText(img1, str(i), (int(x1)+10, int(y1)), cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2)
+            cv2.putText(img2, str(i), (int(x2)+10, int(y2)), cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2)
+        
+        combined = np.hstack((img1, img2))
+        cv2.imwrite(save_path, combined)
+        print(f"[+] Visualization saved: {save_path}")
+    
     def run(self):
         DIFT_reference = os.path.join(str(Path(self.mps_path).parent), 'DIFT_reference')
         src_img_path = os.path.join(DIFT_reference, 'rgb.png')
@@ -272,24 +312,9 @@ class ObjectTrackingDIFT:
             json.dump(json_data, f, indent=4)
         
         self.visualize(src_img_path, tgt_img_path, src_points, pred_points, save_vis_path)
-
-    def visualize(self, src_path, tgt_path, src_pts, tgt_pts, save_path):
-        img1 = cv2.imread(src_path)
-        img2 = cv2.imread(tgt_path)
+        # 关键：运行完后清理
+        self.cleanup()
         
-        colors = [(0, 255, 0), (0, 0, 255), (255, 0, 0), (0, 255, 255), (255, 0, 255), (255, 255, 0)]
-        
-        for i, ((x1, y1), (x2, y2)) in enumerate(zip(src_pts, tgt_pts)):
-            color = colors[i % len(colors)]
-            cv2.circle(img1, (int(x1), int(y1)), 8, color, -1)
-            cv2.circle(img2, (int(x2), int(y2)), 8, color, -1)
-            cv2.putText(img1, str(i), (int(x1)+10, int(y1)), cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2)
-            cv2.putText(img2, str(i), (int(x2)+10, int(y2)), cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2)
-        
-        combined = np.hstack((img1, img2))
-        cv2.imwrite(save_path, combined)
-        print(f"[+] Visualization saved: {save_path}")
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--mps_path", type=str, required=True, help="Path to the MPS directory")

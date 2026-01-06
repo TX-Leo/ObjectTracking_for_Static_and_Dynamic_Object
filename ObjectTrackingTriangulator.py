@@ -47,7 +47,6 @@ class GeometryUtils:
             errors.append(err)
         return np.mean(errors) if errors else 1e6
 
-
 class ObjectTrackingTriangulator:
     def __init__(self, mps_path: str):
         self.mps_path = mps_path
